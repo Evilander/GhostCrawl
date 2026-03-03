@@ -3870,37 +3870,11 @@ def god_mode_main():
     parser.add_argument("--to-year", type=int, default=None, help="End year")
     args, _ = parser.parse_known_args()
 
-    proxies_list = []
-    # Determine proxies file: explicit flag, or auto-detect proxies.txt in script dir
-    proxies_file = args.proxies_file
-    if not proxies_file and not args.proxy:
-        default_proxies = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt")
-        if os.path.isfile(default_proxies):
-            proxies_file = default_proxies
-            console.print(f"[dim]Auto-loaded proxies from {default_proxies}[/dim]")
-
-    if args.proxy:
-        proxies_list.append(args.proxy)
-    elif proxies_file:
-        try:
-            with open(proxies_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    parts = line.split(':')
-                    if len(parts) == 4 and not line.startswith('http'):
-                        # format: host:port:user:pass -> http://user:pass@host:port
-                        host, port, user, pwd = parts
-                        proxies_list.append(f"http://{user}:{pwd}@{host}:{port}")
-                    else:
-                        proxies_list.append(line)
-        except Exception as e:
-            console.print(f"[bold red]Failed to load proxies from {proxies_file}: {e}[/bold red]")
-            sys.exit(1)
-
     tor_mgr = None
     if args.tor:
+        if args.proxy or args.proxies_file:
+            console.print("[bold red]Cannot use --tor with --proxy/--proxies-file[/bold red]")
+            sys.exit(1)
         tor_mgr = TorManager(renew_every=args.tor_renew)
         ok, info = tor_mgr.verify()
         if ok:
@@ -3909,9 +3883,37 @@ def god_mode_main():
             console.print(f"[bold red]Tor connection failed: {info}[/bold red]")
             console.print("[dim]Make sure Tor is running on port 9050 (install: apt install tor / brew install tor)[/dim]")
             sys.exit(1)
+        get_request_manager(tor_manager=tor_mgr)
+    else:
+        proxies_list = []
+        proxies_file = args.proxies_file
+        if not proxies_file and not args.proxy:
+            default_proxies = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt")
+            if os.path.isfile(default_proxies):
+                proxies_file = default_proxies
+                console.print(f"[dim]Auto-loaded proxies from {default_proxies}[/dim]")
 
-    initial_proxy = proxies_list[0] if proxies_list else None
-    get_request_manager(proxy=initial_proxy, tor_manager=tor_mgr)
+        if args.proxy:
+            proxies_list.append(args.proxy)
+        elif proxies_file:
+            try:
+                with open(proxies_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        parts = line.split(':')
+                        if len(parts) == 4 and not line.startswith('http'):
+                            host, port, user, pwd = parts
+                            proxies_list.append(f"http://{user}:{pwd}@{host}:{port}")
+                        else:
+                            proxies_list.append(line)
+            except Exception as e:
+                console.print(f"[bold red]Failed to load proxies from {proxies_file}: {e}[/bold red]")
+                sys.exit(1)
+
+        initial_proxy = proxies_list[0] if proxies_list else None
+        get_request_manager(proxy=initial_proxy)
 
     # Interactive agent team picker
     if args.agent_team == "__pick__":

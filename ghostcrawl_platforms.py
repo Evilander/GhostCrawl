@@ -11,11 +11,9 @@ Integrates APIs and extraction techniques for multiple platforms:
 import requests
 import os
 import sys
-import json
 import time
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin, urlparse, quote
+from urllib.parse import quote
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
@@ -155,42 +153,29 @@ class ImageboardScraper:
         'safebooru': {
             'url': 'https://safebooru.org/index.php?page=dapi&s=post&q=index&json=1',
             'file_key': 'file_url',
-            'preview_key': 'preview_url',
-            'sample_key': 'sample_url',
         },
     }
 
-    def __init__(self, dest=DEFAULT_DEST, workers=4):
+    def __init__(self, dest=DEFAULT_DEST):
         self.session = PlatformSession(rate_limit=1.0)
         self.dest = os.path.join(dest, 'imageboards')
-        self.workers = workers
 
     def search(self, board, tags, limit=50, page=1):
-        """Search an imageboard by tags."""
         if board not in self.BOARDS:
             print(f"  Unknown board: {board}")
             return []
 
         config = self.BOARDS[board]
-        params = {'limit': limit, 'tags': tags}
-        if board in ('safebooru',):
-            params['pid'] = page - 1
-        else:
-            params['page'] = page
+        params = {'limit': limit, 'tags': tags, 'pid': page - 1}
 
-        headers = {}
-        if 'user_agent' in config:
-            headers['User-Agent'] = config['user_agent']
-
-        r = self.session.get(config['url'], params=params, headers=headers)
+        r = self.session.get(config['url'], params=params)
         if r.status_code != 200:
             print(f"  {board}: HTTP {r.status_code}")
             return []
 
-        data = r.json()
-
-        # Normalize response format
-        posts = data if isinstance(data, list) else data.get('posts', data.get('post', []))
+        posts = r.json()
+        if not isinstance(posts, list):
+            posts = posts.get('posts', posts.get('post', []))
         print(f"  {board} '{tags}': {len(posts)} results")
         return posts
 

@@ -201,7 +201,6 @@ class RequestManager:
             self._delay_multiplier[endpoint] = min(
                 self._delay_multiplier[endpoint] * 1.5, 10.0
             )
-            # Renew Tor circuit on rate limit
             if self.tor_manager:
                 self.tor_manager.renew_circuit()
             # Cool-down after 3+ consecutive 429s
@@ -224,36 +223,35 @@ class RequestManager:
 
 
 class TorManager:
-    """Manage Tor SOCKS5 proxy with automatic circuit renewal."""
+    """Tor SOCKS5 proxy with circuit renewal."""
 
     SOCKS_PORT = 9050
     CONTROL_PORT = 9051
     CHECK_URL = "https://check.torproject.org/api/ip"
 
-    def __init__(self, control_password=None, renew_every=50):
+    def __init__(self, renew_every=50):
         self.proxy = f"socks5h://127.0.0.1:{self.SOCKS_PORT}"
-        self.control_password = control_password or os.environ.get("TOR_CONTROL_PASSWORD", "")
+        self.control_password = os.environ.get("TOR_CONTROL_PASSWORD", "")
         self.renew_every = renew_every
         self._request_count = 0
         self._lock = threading.Lock()
+        self._renewal_failed = False
 
     def verify(self):
-        """Check if Tor is running and traffic routes through it."""
         try:
             resp = requests.get(
                 self.CHECK_URL,
                 proxies={"http": self.proxy, "https": self.proxy},
                 timeout=15,
             )
-            data = resp.json()
-            if data.get("IsTor"):
-                return True, data.get("IP", "unknown")
+            check = resp.json()
+            if check.get("IsTor"):
+                return True, check.get("IP", "unknown")
         except Exception as e:
             return False, str(e)
         return False, "Not routing through Tor"
 
     def renew_circuit(self):
-        """Send NEWNYM signal to Tor control port for a fresh circuit."""
         try:
             from stem.control import Controller
             import stem
@@ -267,29 +265,35 @@ class TorManager:
                 return True
         except ImportError:
             return self._renew_raw()
-        except Exception:
+        except Exception as e:
+            if not self._renewal_failed:
+                console.print(f"[yellow]Tor circuit renewal failed: {e}[/yellow]")
+                self._renewal_failed = True
             return False
 
     def _renew_raw(self):
-        """Renew circuit via raw socket when stem is not installed."""
         try:
             with socket.create_connection(("127.0.0.1", self.CONTROL_PORT), timeout=10) as sock:
-                sock.recv(1024)
+                banner = sock.recv(1024)
+                if b"250" not in banner and b"220" not in banner:
+                    return False
                 if self.control_password:
                     sock.sendall(f'AUTHENTICATE "{self.control_password}"\r\n'.encode())
                 else:
                     sock.sendall(b'AUTHENTICATE\r\n')
-                resp = sock.recv(1024).decode()
-                if "250" not in resp:
+                auth_resp = sock.recv(1024).decode()
+                if "250" not in auth_resp:
                     return False
                 sock.sendall(b'SIGNAL NEWNYM\r\n')
-                resp = sock.recv(1024).decode()
-                return "250" in resp
-        except Exception:
+                signal_resp = sock.recv(1024).decode()
+                return "250" in signal_resp
+        except Exception as e:
+            if not self._renewal_failed:
+                console.print(f"[yellow]Tor circuit renewal failed: {e}[/yellow]")
+                self._renewal_failed = True
             return False
 
     def maybe_renew(self):
-        """Increment request counter and renew circuit when threshold is reached."""
         with self._lock:
             self._request_count += 1
             if self._request_count >= self.renew_every:
@@ -1509,8 +1513,9 @@ def mode_browse_targets():
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="GhostCrawl - Dead Site Crawler")
-    parser.add_argument("--proxy", help="SOCKS5 proxy (e.g. socks5://127.0.0.1:9050)")
-    parser.add_argument("--tor", action="store_true", help="Route all traffic through Tor (requires Tor on port 9050)")
+    proxy_group = parser.add_mutually_exclusive_group()
+    proxy_group.add_argument("--proxy", help="SOCKS5 proxy (e.g. socks5://127.0.0.1:9050)")
+    proxy_group.add_argument("--tor", action="store_true", help="Route all traffic through Tor (requires Tor on port 9050)")
     parser.add_argument("--tor-renew", type=int, default=50, metavar="N", help="Renew Tor circuit every N requests (default: 50)")
     parser.add_argument("--dest", help=f"Download directory (default: {DEFAULT_DEST})")
     args, _ = parser.parse_known_args()
