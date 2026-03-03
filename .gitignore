@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Excluded project files (local only)
+ghostcrawl_god.py
+ghostcrawl_fansly.py
+treasury_*.py
+check_program_treasuries.py
+test_decodo.py
+
+# Separate projects (not part of GhostCrawl)
+epstein_archive/
+ghostbid/
+retroradar/
+waybackdj/
+sampleghost/
+
+# IDE / editor
+.serena/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Downloads / data
+downloads/
+*.json.bak
+.ghostlight_history.json
+proxies.txt
+
+# Environment
+.env
+.env.*
+*.pem
+*.key
+
+# OS
+Thumbs.db
+.DS_Store
