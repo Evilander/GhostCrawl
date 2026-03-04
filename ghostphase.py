@@ -1410,38 +1410,47 @@ class GhostPhase:
 # CLI
 # ──────────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="GhostPhase — Universal File Extraction Engine",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+def main(target_override=None, dest=None, download=True, turbo=False):
+    if target_override:
+        url = target_override
+        do_download = download
+        workers = 6 if turbo else 4
+        dest_dir = dest
+    else:
+        parser = argparse.ArgumentParser(
+            description="GhostPhase — Universal File Extraction Engine",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
 Examples:
   python ghostphase.py https://example.com/gallery
   python ghostphase.py https://deadsite.com --download
   python ghostphase.py https://protectedsite.com/files --turbo
   python ghostphase.py https://oldsite.com --dest D:\\recovered
-        """
-    )
-    parser.add_argument("url", help="Target URL to extract files from")
-    parser.add_argument("--download", "-d", action="store_true", help="Download all discovered files")
-    parser.add_argument("--turbo", "-t", action="store_true", help="Use more parallel threads")
-    parser.add_argument("--dest", default=None, help="Download destination directory")
-    parser.add_argument("--workers", type=int, default=4, help="Max parallel workers")
-    args = parser.parse_args()
+            """
+        )
+        parser.add_argument("url", help="Target URL to extract files from")
+        parser.add_argument("--download", "-d", action="store_true", help="Download all discovered files")
+        parser.add_argument("--turbo", "-t", action="store_true", help="Use more parallel threads")
+        parser.add_argument("--dest", default=None, help="Download destination directory")
+        parser.add_argument("--workers", type=int, default=4, help="Max parallel workers")
+        args = parser.parse_args()
 
-    workers = 6 if args.turbo else args.workers
+        url = args.url
+        do_download = args.download
+        workers = 6 if args.turbo else args.workers
+        dest_dir = args.dest
 
     engine = GhostPhase(
-        target_url=args.url,
-        dest_dir=args.dest,
+        target_url=url,
+        dest_dir=dest_dir,
         max_workers=workers,
     )
 
     targets = engine.run()
 
-    if args.download and targets:
+    if do_download and targets:
         engine.download_all(max_workers=workers)
-    elif targets and not args.download:
+    elif targets and not do_download:
         console.print(f"\n[bold]Run with --download to grab all {len(targets)} files[/bold]")
 
 

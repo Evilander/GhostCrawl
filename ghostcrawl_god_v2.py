@@ -2425,7 +2425,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 class CrawlAgent:
-    def __init__(self, persona, domain, target_types, assigned_years, coordinator, proxy=None):
+    def __init__(self, persona, domain, target_types, assigned_years, coordinator, proxy=None, tor_manager=None):
         self.persona = persona
         self.name = persona["name"]
         self.domain = domain
@@ -2434,7 +2434,7 @@ class CrawlAgent:
         self.coordinator = coordinator
         self.preflight_pages = None  # Set by coordinator for direct page distribution
 
-        self.rm = RequestManager(proxy=proxy, pool_size=2)
+        self.rm = RequestManager(proxy=proxy, pool_size=2, tor_manager=tor_manager)
 
         self.ai_client = None
         if _ai_available:
@@ -2536,7 +2536,8 @@ class CrawlAgent:
                     "from": str(year),
                     "to": str(year + 1),
                 }
-                resp = self.rm.get(CDX, params=params, timeout=20)
+                cdx_to = 60 if self.rm.tor_manager else 20
+                resp = self.rm.get(CDX, params=params, timeout=cdx_to)
                 if resp.status_code == 200:
                     try:
                         data = resp.json()
@@ -2552,7 +2553,7 @@ class CrawlAgent:
                 # If no results, retry without any filter
                 if not pages:
                     params.pop("filter", None)
-                    resp = self.rm.get(CDX, params=params, timeout=20)
+                    resp = self.rm.get(CDX, params=params, timeout=cdx_to)
                     if resp.status_code == 200:
                         try:
                             data = resp.json()
@@ -2809,7 +2810,7 @@ class CrawlAgent:
 # ---------------------------------------------------------------------------
 
 class CrawlCoordinator:
-    def __init__(self, domain, target_types, from_year, to_year, num_agents=5, proxies=None, dest_dir=None, agent_team=None, yolo=False):
+    def __init__(self, domain, target_types, from_year, to_year, num_agents=5, proxies=None, dest_dir=None, agent_team=None, yolo=False, tor_manager=None):
         self.domain = domain
         self.target_types = target_types
         self.from_year = from_year
@@ -2817,6 +2818,7 @@ class CrawlCoordinator:
         self.agent_team = [name.strip().upper() for name in agent_team.split(",")] if agent_team else None
         self.num_agents = len(self.agent_team) if self.agent_team else min(num_agents, len(AGENT_PERSONAS))
         self.proxies = proxies or []
+        self.tor_manager = tor_manager
         self.dest_dir = dest_dir
         self.yolo = yolo
 
@@ -2885,12 +2887,15 @@ class CrawlCoordinator:
         # Strategy 1: Query with text/html filter
         # Strategy 2: If empty, query WITHOUT mimetype filter (catches mistyped mimetypes)
         # Strategy 3: If still empty, try without any filters at all
+        # Smaller limit for Tor (CDX is slow through SOCKS proxy)
+        page_limit = 500 if self.tor_manager else 5000
+
         strategies = [
             {
                 "url": self.domain,
                 "matchType": "domain",
                 "output": "json",
-                "limit": 5000,
+                "limit": page_limit,
                 "fl": "timestamp,original,mimetype,statuscode",
                 "filter": ["statuscode:200", "!mimetype:warc/revisit"],
                 "collapse": "urlkey",
@@ -2901,7 +2906,7 @@ class CrawlCoordinator:
                 "url": self.domain,
                 "matchType": "domain",
                 "output": "json",
-                "limit": 5000,
+                "limit": page_limit,
                 "fl": "timestamp,original,mimetype,statuscode",
                 "filter": "statuscode:200",
                 "collapse": "urlkey",
@@ -2912,7 +2917,7 @@ class CrawlCoordinator:
                 "url": self.domain,
                 "matchType": "domain",
                 "output": "json",
-                "limit": 5000,
+                "limit": page_limit,
                 "fl": "timestamp,original",
                 "collapse": "urlkey",
                 "from": str(self.from_year),
@@ -2920,11 +2925,14 @@ class CrawlCoordinator:
             },
         ]
 
+        # CDX through Tor needs much longer timeout
+        cdx_timeout = 90 if self.tor_manager else 30
+
         for strat_idx, params in enumerate(strategies):
             if all_pages:
                 break
             try:
-                resp = _cdx_request(params, timeout=30)
+                resp = _cdx_request(params, timeout=cdx_timeout)
                 if resp is None:
                     console.print(f"[dim]CDX strategy {strat_idx+1}: all archives unreachable[/dim]")
                     continue
@@ -3190,6 +3198,7 @@ class CrawlCoordinator:
                 assigned_years=zones[i],
                 coordinator=self,
                 proxy=agent_proxy,
+                tor_manager=self.tor_manager,
             )
             self.agents.append(agent)
 
@@ -3856,7 +3865,7 @@ def god_mode_main():
     parser = argparse.ArgumentParser(description="GhostCrawl GOD Mode - Multi-Agent Lost Media Recovery")
     parser.add_argument("--proxy", help="SOCKS5/HTTP proxy (e.g. socks5://127.0.0.1:9050)")
     parser.add_argument("--proxies-file", help="File containing list of proxies (format: host:port:user:pass or http://...)")
-    parser.add_argument("--tor", action="store_true", help="Route all traffic through Tor (requires Tor on port 9050)")
+    parser.add_argument("--tor", action="store_true", help="Route all traffic through Tor (auto-detects standalone 9050 or Tor Browser 9150)")
     parser.add_argument("--tor-renew", type=int, default=50, metavar="N", help="Renew Tor circuit every N requests (default: 50)")
     parser.add_argument("--dest", help=f"Download directory (default: {DEFAULT_DEST})")
     parser.add_argument("--agents", type=int, default=5, choices=range(1, 28),
@@ -3871,6 +3880,7 @@ def god_mode_main():
     args, _ = parser.parse_known_args()
 
     tor_mgr = None
+    proxies_list = []
     if args.tor:
         if args.proxy or args.proxies_file:
             console.print("[bold red]Cannot use --tor with --proxy/--proxies-file[/bold red]")
@@ -3881,7 +3891,7 @@ def god_mode_main():
             console.print(f"[bold green]Tor connected — exit IP: {info}[/bold green]")
         else:
             console.print(f"[bold red]Tor connection failed: {info}[/bold red]")
-            console.print("[dim]Make sure Tor is running on port 9050 (install: apt install tor / brew install tor)[/dim]")
+            console.print("[dim]Make sure Tor is running (standalone on 9050 or Tor Browser on 9150)[/dim]")
             sys.exit(1)
         get_request_manager(tor_manager=tor_mgr)
     else:
@@ -3936,45 +3946,161 @@ def god_mode_main():
         from_year = args.from_year or 1996
         to_year = args.to_year or 2026
     else:
-        # Interactive mode with back button support
+        # ═══════════════════════════════════════════════════════════
+        # COMMAND CENTER — Categorized hub for all GhostCrawl modules
+        # ═══════════════════════════════════════════════════════════
         while True:
+            console.print("\n[bold red]GHOSTCRAWL COMMAND CENTER[/bold red]")
             entry_mode = inquirer.select(
-                message="How to pick a target?",
+                message="Select operation:",
                 choices=[
-                    {"name": "🔍 Browse curated domain list", "value": "browse"},
-                    {"name": "✏️  Enter a domain manually", "value": "manual"},
-                    {"name": "🏴‍☠️ OpenDir & FTP Hunter (Live Web)", "value": "opendir"},
-                    {"name": "🌐 TRIANGULATE - Cross-archive search", "value": "triangulate"},
-                    {"name": "🧠 MINDREADER - LLM webmaster profiler", "value": "mindreader"},
-                    {"name": "💰 PROSPECTOR - Crypto vaults, expired domains, bounties", "value": "prospector"},
-                    {"name": "🔎 KEYWORD HUNTER - Search domains for specific terms", "value": "keyword"},
-                    {"name": "🚪 Exit", "value": "exit"},
+                    # ARCHIVE HUNTING
+                    {"name": "--- ARCHIVE HUNTING ---", "value": None, "enabled": False},
+                    {"name": "  GOD MODE - Competitive AI agent swarm", "value": "god"},
+                    {"name": "  Basic Crawl - Dead site crawler via Wayback", "value": "basic_crawl"},
+                    {"name": "  Common Crawl - Deep mine CC S3 archives", "value": "commoncrawl"},
+                    {"name": "  GhostPhase - Universal file extraction engine", "value": "ghostphase"},
+                    {"name": "  Triangulate - Cross-archive search", "value": "triangulate"},
+                    # LIVE WEB
+                    {"name": "--- LIVE WEB ---", "value": None, "enabled": False},
+                    {"name": "  LiveHunt - Shodan/GitHub/OpenDir scanner", "value": "livehunt"},
+                    {"name": "  Platforms - Patreon/Reddit/Imageboard scraper", "value": "platforms"},
+                    {"name": "  OpenDir God - Open directory keyword hunter", "value": "opendir"},
+                    # INTELLIGENCE
+                    {"name": "--- INTELLIGENCE ---", "value": None, "enabled": False},
+                    {"name": "  MindReader - LLM webmaster profiler", "value": "mindreader"},
+                    {"name": "  Prospector - Crypto vaults, expired domains, bounties", "value": "prospector"},
+                    {"name": "  Keyword Hunter - Search domains for specific terms", "value": "keyword"},
+                    # RESEARCH
+                    {"name": "--- RESEARCH ---", "value": None, "enabled": False},
+                    {"name": "  Epstein Archive - DOJ docs, knowledge graph, flights, RAG", "value": "epstein"},
+                    # EXIT
+                    {"name": "--- ---", "value": None, "enabled": False},
+                    {"name": "  Exit", "value": "exit"},
                 ],
             ).execute()
 
             if entry_mode == "exit":
                 return
 
+            # ── GOD MODE ──
+            if entry_mode == "god":
+                god_sub = inquirer.select(
+                    message="GOD MODE target selection:",
+                    choices=[
+                        {"name": "Browse curated domain list", "value": "browse"},
+                        {"name": "Enter a domain manually", "value": "manual"},
+                        {"name": "<< Back", "value": "__back__"},
+                    ],
+                ).execute()
+                if god_sub == "__back__":
+                    continue
+
+                if god_sub == "browse":
+                    domain = mode_browse_targets()
+                    if not domain:
+                        continue
+                else:
+                    domain = inquirer.text(message="Domain to crawl (e.g. deadsite.com):").execute()
+                    if not domain.strip():
+                        continue
+
+                domain = domain.strip().replace("http://", "").replace("https://", "").rstrip("/")
+                proceed = inquirer.confirm(message=f"Target: {domain} -- proceed?", default=True).execute()
+                if not proceed:
+                    continue
+                break  # proceed to GOD MODE crawl setup below
+
+            # ── BASIC CRAWL ──
+            if entry_mode == "basic_crawl":
+                from ghostcrawl import base_crawl_main
+                bc_target = inquirer.text(message="Domain to crawl:").execute()
+                if not bc_target.strip():
+                    continue
+                base_crawl_main(domain=bc_target.strip())
+                continue
+
+            # ── COMMON CRAWL ──
+            if entry_mode == "commoncrawl":
+                from ghostcrawl_commoncrawl import main as cc_main
+                cc_mode = inquirer.select(
+                    message="Common Crawl mode:",
+                    choices=[
+                        {"name": "Mine domain - Full CC deep search", "value": "mine"},
+                        {"name": "Triangulate username across platforms", "value": "triangulate"},
+                        {"name": "CDN archaeology - Find CDN domains", "value": "cdn"},
+                        {"name": "<< Back", "value": "__back__"},
+                    ],
+                ).execute()
+                if cc_mode == "__back__":
+                    continue
+                cc_target = inquirer.text(message="Domain or username:").execute()
+                if not cc_target.strip():
+                    continue
+                cc_main(target_override=cc_target.strip(), mode=cc_mode)
+                continue
+
+            # ── GHOSTPHASE ──
+            if entry_mode == "ghostphase":
+                from ghostphase import main as gp_main
+                gp_url = inquirer.text(message="URL to extract files from:").execute()
+                if not gp_url.strip():
+                    continue
+                gp_turbo = inquirer.confirm(message="TURBO mode (more threads)?", default=False).execute()
+                gp_main(target_override=gp_url.strip(), turbo=gp_turbo)
+                continue
+
+            # ── TRIANGULATE ──
             if entry_mode == "triangulate":
                 from ghostcrawl_triangulate import main as triangulate_main
-                triangulate_main()
-                return
+                tri_target = inquirer.text(message="URL or domain to triangulate:").execute()
+                if not tri_target.strip():
+                    continue
+                triangulate_main(target_override=tri_target.strip())
+                continue
 
-            if entry_mode == "mindreader":
-                from ghostcrawl_mindreader import main as mindreader_main
-                mindreader_main()
-                return
+            # ── LIVEHUNT ──
+            if entry_mode == "livehunt":
+                from ghostcrawl_livehunt import main as lh_main
+                lh_mode = inquirer.select(
+                    message="LiveHunt mode:",
+                    choices=[
+                        {"name": "All hunts (Shodan + GitHub)", "value": "all"},
+                        {"name": "Shodan - Open directory discovery", "value": "shodan"},
+                        {"name": "GitHub - Leaked files/keys scanner", "value": "github"},
+                        {"name": "OpenDir - Enumerate a specific URL", "value": "opendir"},
+                        {"name": "<< Back", "value": "__back__"},
+                    ],
+                ).execute()
+                if lh_mode == "__back__":
+                    continue
+                lh_target = inquirer.text(message="Domain or URL:").execute()
+                if not lh_target.strip():
+                    continue
+                lh_main(target_override=lh_target.strip(), mode=lh_mode)
+                continue
 
-            if entry_mode == "prospector":
-                from ghostcrawl_prospector import main as prospector_main
-                prospector_main()
-                return
+            # ── PLATFORMS ──
+            if entry_mode == "platforms":
+                from ghostcrawl_platforms import main as plat_main
+                plat = inquirer.select(
+                    message="Platform:",
+                    choices=[
+                        {"name": "Patreon - Creator search", "value": "patreon"},
+                        {"name": "Imageboard - Tag-based image scraping", "value": "imageboard"},
+                        {"name": "Reddit - Subreddit media extraction", "value": "reddit"},
+                        {"name": "<< Back", "value": "__back__"},
+                    ],
+                ).execute()
+                if plat == "__back__":
+                    continue
+                plat_query = inquirer.text(message="Search query / subreddit / tags:").execute()
+                if not plat_query.strip():
+                    continue
+                plat_main(target_override=plat_query.strip(), platform=plat)
+                continue
 
-            if entry_mode == "keyword":
-                from ghostcrawl_prospector import keyword_hunter_main
-                keyword_hunter_main()
-                return
-
+            # ── OPENDIR GOD ──
             if entry_mode == "opendir":
                 import subprocess
                 query = inquirer.text(message="Keyword to search for (e.g. 'mario', 'soundtrack', '90s'):").execute()
@@ -3986,33 +4112,42 @@ def god_mode_main():
                 if args.yolo:
                     cmd.append("--yolo")
                 subprocess.run(cmd)
-                return
+                continue
 
-            if entry_mode == "browse":
-                domain = mode_browse_targets()
-                if not domain:
-                    continue  # back to menu
-            else:
-                domain = inquirer.text(message="Domain to crawl (e.g. deadsite.com):").execute()
-                if not domain.strip():
-                    continue  # back to menu
+            # ── MINDREADER ──
+            if entry_mode == "mindreader":
+                from ghostcrawl_mindreader import main as mindreader_main
+                mindreader_main()
+                continue
 
-            domain = domain.strip().replace("http://", "").replace("https://", "").rstrip("/")
+            # ── PROSPECTOR ──
+            if entry_mode == "prospector":
+                from ghostcrawl_prospector import main as prospector_main
+                prospector_main()
+                continue
 
-            # Confirm domain before proceeding
-            proceed = inquirer.confirm(message=f"Target: {domain} — proceed?", default=True).execute()
-            if not proceed:
-                continue  # back to menu
+            # ── KEYWORD HUNTER ──
+            if entry_mode == "keyword":
+                from ghostcrawl_prospector import keyword_hunter_main
+                keyword_hunter_main()
+                continue
 
-            break  # domain selected, move on
+            # ── EPSTEIN ARCHIVE ──
+            if entry_mode == "epstein":
+                sys.path.insert(0, os.path.join(os.path.dirname(__file__), "epstein_archive"))
+                from epstein_main import main as epstein_main
+                epstein_main()
+                continue
 
-        # Choose between category-level or granular extension picking
+        # ═══════════════════════════════════════════════════════════
+        # GOD MODE CRAWL SETUP (only reached when entry_mode == "god" + break)
+        # ═══════════════════════════════════════════════════════════
         pick_mode = inquirer.select(
             message="How to select file types?",
             choices=[
-                {"name": "🎯 ALL file types", "value": "all"},
-                {"name": "📂 Pick by category (audio, video, etc.)", "value": "category"},
-                {"name": "🔍 Pick individual extensions (granular)", "value": "granular"},
+                {"name": "ALL file types", "value": "all"},
+                {"name": "Pick by category (audio, video, etc.)", "value": "category"},
+                {"name": "Pick individual extensions (granular)", "value": "granular"},
             ],
         ).execute()
 
@@ -4034,7 +4169,6 @@ def god_mode_main():
                         target_exts.update(INTERESTING_EXTENSIONS[cat])
         elif pick_mode == "granular":
             ext_choices = []
-            # Pre-select high-value types, leave images/web off by default
             default_on = {"audio", "video", "flash", "archive", "software", "document"}
             for cat, exts in INTERESTING_EXTENSIONS.items():
                 enabled = cat in default_on
@@ -4054,7 +4188,7 @@ def god_mode_main():
                 target_exts = set(selected_exts)
 
         from_year = int(inquirer.text(message="Start year (default 1996):", default="1996").execute())
-        to_year = int(inquirer.text(message="End year (default 2024):", default="2026").execute())
+        to_year = int(inquirer.text(message="End year (default 2026):", default="2026").execute())
 
     base_dest = args.dest if args.dest else DEFAULT_DEST
     dest_dir = os.path.join(base_dest, sanitize_filename(domain))
@@ -4069,6 +4203,7 @@ def god_mode_main():
         dest_dir=dest_dir,
         agent_team=args.agent_team,
         yolo=args.yolo,
+        tor_manager=tor_mgr,
     )
     coordinator.run()
 

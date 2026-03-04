@@ -35,6 +35,19 @@ downloads/
 *.json.bak
 .ghostlight_history.json
 proxies.txt
+keyword_*.json
+
+# GhostIndex database (local cache, regenerates)
+ghostindex.db
+ghostindex.db-shm
+ghostindex.db-wal
+
+# Unsloth compiled cache
+unsloth_compiled_cache/
+
+# Misc local files
+pliny_agent.md
+x3d_optimizer.py
 
 # Environment
 .env

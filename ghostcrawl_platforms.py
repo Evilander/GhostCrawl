@@ -334,19 +334,33 @@ class RedditScraper:
 #  CLI
 # ===========================================================================
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description='GhostCrawl Platform Scrapers')
-    parser.add_argument('platform', choices=['patreon', 'imageboard', 'reddit'],
-                        help='Platform to scrape')
-    parser.add_argument('query', help='Search query / subreddit / tags')
-    parser.add_argument('--dest', default=DEFAULT_DEST)
-    parser.add_argument('--limit', type=int, default=30)
-    parser.add_argument('--download', action='store_true', help='Download content')
-    parser.add_argument('--board', default='safebooru', help='Imageboard name')
-    parser.add_argument('--sort', default='hot', help='Reddit sort order')
+def main(target_override=None, platform=None, dest=None, download=True,
+         limit=30, board='safebooru', sort='hot'):
+    if target_override:
+        # Called from god_v2 — bypass argparse
+        class Args:
+            pass
+        args = Args()
+        args.platform = platform or 'patreon'
+        args.query = target_override
+        args.dest = dest or DEFAULT_DEST
+        args.limit = limit
+        args.download = download
+        args.board = board
+        args.sort = sort
+    else:
+        import argparse
+        parser = argparse.ArgumentParser(description='GhostCrawl Platform Scrapers')
+        parser.add_argument('platform', choices=['patreon', 'imageboard', 'reddit'],
+                            help='Platform to scrape')
+        parser.add_argument('query', help='Search query / subreddit / tags')
+        parser.add_argument('--dest', default=DEFAULT_DEST)
+        parser.add_argument('--limit', type=int, default=30)
+        parser.add_argument('--download', action='store_true', help='Download content')
+        parser.add_argument('--board', default='safebooru', help='Imageboard name')
+        parser.add_argument('--sort', default='hot', help='Reddit sort order')
 
-    args = parser.parse_args()
+        args = parser.parse_args()
 
     if args.platform == 'patreon':
         pt = PatreonScraper(dest=args.dest)

@@ -830,16 +830,24 @@ def display_triangulation(results, title="Cross-Archive Triangulation"):
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 
-def main():
+def main(target_override=None):
     import argparse
-    parser = argparse.ArgumentParser(description="GhostCrawl Cross-Archive Triangulation")
-    parser.add_argument("target", help="URL or domain to search across archives")
-    parser.add_argument("--extensions", "-e", help="Comma-separated file extensions to filter (domain mode)")
-    parser.add_argument("--no-ia", action="store_true", help="Skip Internet Archive Software Collection search")
-    parser.add_argument("--live", action="store_true", help="Include live discovery (Shodan, Censys)")
-    args = parser.parse_args()
-
-    target = args.target.strip()
+    if target_override:
+        target = target_override.strip()
+        extensions = None
+        no_ia = False
+        live = False
+    else:
+        parser = argparse.ArgumentParser(description="GhostCrawl Cross-Archive Triangulation")
+        parser.add_argument("target", help="URL or domain to search across archives")
+        parser.add_argument("--extensions", "-e", help="Comma-separated file extensions to filter (domain mode)")
+        parser.add_argument("--no-ia", action="store_true", help="Skip Internet Archive Software Collection search")
+        parser.add_argument("--live", action="store_true", help="Include live discovery (Shodan, Censys)")
+        args = parser.parse_args()
+        target = args.target.strip()
+        extensions = args.extensions
+        no_ia = args.no_ia
+        live = args.live
 
     # Show which API keys are available
     key_status = []
@@ -858,15 +866,15 @@ def main():
     if target.startswith("http://") or target.startswith("https://"):
         # Single URL mode
         console.print("[bold]Mode:[/bold] Single URL triangulation")
-        results = triangulate_url(target, include_ia_software=not args.no_ia, include_live=args.live)
+        results = triangulate_url(target, include_ia_software=not no_ia, include_live=live)
         display_triangulation(results, f"Triangulation: {target.split('/')[-1][:40]}")
     else:
         # Domain mode
-        extensions = None
-        if args.extensions:
-            extensions = set(args.extensions.split(","))
+        ext_set = None
+        if extensions:
+            ext_set = set(extensions.split(","))
         console.print(f"[bold]Mode:[/bold] Domain-wide search")
-        hits = triangulate_domain(target, extensions=extensions, include_live=args.live)
+        hits = triangulate_domain(target, extensions=ext_set, include_live=live)
 
         # Group by archive for display
         results = defaultdict(list)

@@ -458,7 +458,7 @@ def main():
     # Load crawled URLs
     crawled_urls = []
     if args.urls_file:
-        with open(args.urls_file) as f:
+        with open(args.urls_file, encoding='utf-8') as f:
             crawled_urls = [line.strip() for line in f if line.strip()]
     else:
         # Quick CDX query to get visible structure

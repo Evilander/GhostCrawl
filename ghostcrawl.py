@@ -44,6 +44,29 @@ from InquirerPy import inquirer
 
 console = Console()
 
+# GhostIndex singleton — lazy init
+_ghost_index = None
+_ghost_index_disabled = False
+
+def get_ghost_index():
+    """Get the GhostIndex singleton (lazy init). Returns None if disabled."""
+    global _ghost_index, _ghost_index_disabled
+    if _ghost_index_disabled:
+        return None
+    if _ghost_index is None:
+        try:
+            from ghostindex import GhostIndex
+            _ghost_index = GhostIndex.get_instance()
+        except Exception:
+            _ghost_index_disabled = True
+            return None
+    return _ghost_index
+
+def disable_ghost_index():
+    """Disable GhostIndex (--no-cache mode)."""
+    global _ghost_index_disabled
+    _ghost_index_disabled = True
+
 
 class RequestManager:
     USER_AGENTS = [
@@ -197,19 +220,26 @@ class RequestManager:
 
         if resp.status_code == 429:
             self._consecutive_429s[endpoint] += 1
-            # Increase delay multiplier
-            self._delay_multiplier[endpoint] = min(
-                self._delay_multiplier[endpoint] * 1.5, 10.0
-            )
             if self.tor_manager:
-                self.tor_manager.renew_circuit()
-            # Cool-down after 3+ consecutive 429s
-            if self._consecutive_429s[endpoint] >= 3:
-                cooldown = random.uniform(30, 60)
-                console.print(f"  [yellow]Rate limited on {endpoint} — cooling down {cooldown:.0f}s[/yellow]")
-                time.sleep(cooldown)
-                self._consecutive_429s[endpoint] = 0
-            # Rotate to a different session
+                # New circuit = new IP = rate limits reset
+                renewed = self.tor_manager.renew_circuit()
+                if renewed:
+                    self._delay_multiplier[endpoint] = 1.0
+                    self._consecutive_429s[endpoint] = 0
+                    time.sleep(random.uniform(1, 3))
+                else:
+                    self._delay_multiplier[endpoint] = min(
+                        self._delay_multiplier[endpoint] * 1.3, 5.0
+                    )
+            else:
+                self._delay_multiplier[endpoint] = min(
+                    self._delay_multiplier[endpoint] * 1.5, 10.0
+                )
+                if self._consecutive_429s[endpoint] >= 3:
+                    cooldown = random.uniform(30, 60)
+                    console.print(f"  [yellow]Rate limited on {endpoint} — cooling down {cooldown:.0f}s[/yellow]")
+                    time.sleep(cooldown)
+                    self._consecutive_429s[endpoint] = 0
             self._rotate_session()
         else:
             # Gradual recovery on success
@@ -223,19 +253,36 @@ class RequestManager:
 
 
 class TorManager:
-    """Tor SOCKS5 proxy with circuit renewal."""
+    """Tor SOCKS5 proxy with circuit renewal.
 
-    SOCKS_PORT = 9050
-    CONTROL_PORT = 9051
+    Auto-detects standalone Tor (9050/9051) or Tor Browser (9150/9151).
+    """
+
+    # Standalone Tor daemon ports, then Tor Browser ports
+    SOCKS_PORTS = [9050, 9150]
+    CONTROL_PORTS = {9050: 9051, 9150: 9151}
     CHECK_URL = "https://check.torproject.org/api/ip"
 
     def __init__(self, renew_every=50):
-        self.proxy = f"socks5h://127.0.0.1:{self.SOCKS_PORT}"
+        self.socks_port = self._detect_socks_port()
+        self.control_port = self.CONTROL_PORTS.get(self.socks_port, self.socks_port + 1)
+        self.proxy = f"socks5h://127.0.0.1:{self.socks_port}"
         self.control_password = os.environ.get("TOR_CONTROL_PASSWORD", "")
         self.renew_every = renew_every
         self._request_count = 0
         self._lock = threading.Lock()
         self._renewal_failed = False
+
+    def _detect_socks_port(self):
+        """Try connecting to known Tor SOCKS ports to find which is running."""
+        for port in self.SOCKS_PORTS:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
+                    sock.close()
+                    return port
+            except (ConnectionRefusedError, OSError, socket.timeout):
+                continue
+        return self.SOCKS_PORTS[0]
 
     def verify(self):
         try:
@@ -246,7 +293,8 @@ class TorManager:
             )
             check = resp.json()
             if check.get("IsTor"):
-                return True, check.get("IP", "unknown")
+                port_label = "Tor Browser" if self.socks_port == 9150 else "standalone Tor"
+                return True, f"{check.get('IP', 'unknown')} ({port_label})"
         except Exception as e:
             return False, str(e)
         return False, "Not routing through Tor"
@@ -255,13 +303,13 @@ class TorManager:
         try:
             from stem.control import Controller
             import stem
-            with Controller.from_port(port=self.CONTROL_PORT) as controller:
+            with Controller.from_port(port=self.control_port) as controller:
                 if self.control_password:
                     controller.authenticate(password=self.control_password)
                 else:
                     controller.authenticate()
                 controller.signal(stem.Signal.NEWNYM)
-                time.sleep(5)
+                time.sleep(2)
                 return True
         except ImportError:
             return self._renew_raw()
@@ -273,7 +321,7 @@ class TorManager:
 
     def _renew_raw(self):
         try:
-            with socket.create_connection(("127.0.0.1", self.CONTROL_PORT), timeout=10) as sock:
+            with socket.create_connection(("127.0.0.1", self.control_port), timeout=10) as sock:
                 banner = sock.recv(1024)
                 if b"250" not in banner and b"220" not in banner:
                     return False
@@ -543,14 +591,23 @@ def wayback_sparkline(url):
     Query the Wayback Machine's internal sparkline API.
     Returns years with captures - sometimes exposes snapshots not in CDX.
     """
+    # Check GhostIndex first
+    gi = get_ghost_index()
+    if gi:
+        cached = gi.sparkline(url)
+        if cached:
+            return cached
+
     try:
         spark_url = f"https://web.archive.org/__wb/sparkline?output=json&url={quote(url)}&collection=web"
         resp = get_request_manager().get(spark_url, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             years = data.get("years", {})
-            # years is {"2005": [0,0,3,0,1,...], "2006": [...]} - captures per month
             active_years = {y: sum(months) for y, months in years.items() if sum(months) > 0}
+            # Cache the result
+            if gi and active_years:
+                gi.cache_sparkline(url, active_years)
             return active_years
     except Exception:
         pass
@@ -647,13 +704,56 @@ class _FallbackResponse:
 
 
 def _cdx_request(params, timeout=20):
-    """Make a CDX request with automatic fallback to alternative archives."""
+    """Make a CDX request with automatic fallback to alternative archives.
+    Results are automatically cached in GhostIndex when available."""
     global _wayback_alive
+
+    # Check GhostIndex cache first
+    gi = get_ghost_index()
+    if gi:
+        url = params.get("url", "")
+        match_type = params.get("matchType", "exact")
+        limit = int(params.get("limit", 200))
+        status_filter = None
+        filters = params.get("filter", [])
+        if isinstance(filters, str):
+            filters = [filters]
+        for f in filters:
+            if f.startswith("statuscode:"):
+                status_filter = int(f.split(":")[1])
+
+        cached = gi.cdx_search(url, match_type=match_type, limit=limit,
+                               status_filter=status_filter)
+        if cached:
+            # Convert back to Wayback JSON format for compatibility
+            if cached:
+                keys = ["timestamp", "url", "mime_type", "status_code",
+                        "digest", "content_length"]
+                field_map = {"mime_type": "mimetype", "status_code": "statuscode",
+                             "content_length": "length", "url": "original"}
+                headers = [field_map.get(k, k) for k in keys]
+                result = [headers]
+                for rec in cached:
+                    result.append([str(rec.get(k, "")) for k in keys])
+
+                class _CachedResponse:
+                    status_code = 200
+                    def json(self_inner):
+                        return result
+                return _CachedResponse()
+
     # Try primary Wayback first (skip if already known dead)
     if _wayback_alive is not False:
         try:
             resp = get_request_manager().get(CDX, params=params, timeout=timeout)
             if resp.status_code == 200:
+                # Cache the response in GhostIndex
+                if gi:
+                    try:
+                        data = resp.json()
+                        gi.ingest_cdx_json(params.get("url", ""), data, source="wayback")
+                    except Exception:
+                        pass
                 return resp
         except (requests.exceptions.ConnectionError, ConnectionRefusedError):
             _wayback_alive = False
@@ -745,12 +845,13 @@ _wayback_alive = None  # None = unknown, True = reachable, False = dead
 
 
 def _check_wayback_alive():
-    """Quick connectivity check — cached for the session."""
+    """Quick connectivity check — cached for the session. Routes through Tor if active."""
     global _wayback_alive
     if _wayback_alive is not None:
         return _wayback_alive
     try:
-        resp = requests.head("https://web.archive.org/", timeout=5)
+        rm = get_request_manager()
+        resp = rm._session.head("https://web.archive.org/", timeout=8)
         _wayback_alive = resp.status_code < 500
     except Exception:
         _wayback_alive = False
@@ -836,26 +937,19 @@ def _try_direct_download(original_url, dest_path, timeout=30):
 
 
 def _try_download_from_archive(wb_base, timestamp, original_url, dest_path, timeout=60,
-                                override_timestamps=None):
+                                override_timestamps=None, deadline=None):
     """Try downloading a file from a specific archive. Returns (success, size, reason).
 
     If override_timestamps is provided, uses those instead of hardcoded fallbacks.
+    If deadline (time.time() value) is provided, bail out when exceeded.
     """
     if override_timestamps:
         timestamps_to_try = list(override_timestamps)
     else:
         timestamps_to_try = [timestamp] if timestamp else []
-        # Broader fallback range — more years, more chances
         timestamps_to_try.extend([
-            "20260101000000", "20250101000000", "20240101000000",
-            "20230101000000", "20220101000000", "20210101000000",
-            "20200101000000", "20190101000000", "20180101000000",
-            "20170101000000", "20160101000000", "20150101000000",
-            "20140101000000", "20120101000000", "20100101000000",
-            "20080101000000", "20060101000000", "20050101000000",
-            "20040101000000", "20030101000000", "20020101000000",
-            "20010101000000", "20000101000000", "19990101000000",
-            "19980101000000", "0",
+            "20250101000000", "20220101000000", "20190101000000",
+            "20150101000000", "20100101000000", "0",
         ])
     seen = set()
     unique_ts = []
@@ -866,21 +960,28 @@ def _try_download_from_archive(wb_base, timestamp, original_url, dest_path, time
 
     last_reason = "unknown"
     for ts in unique_ts:
+        if deadline and time.time() > deadline:
+            last_reason = "time_budget_exceeded"
+            break
+
         dl_url = f"{wb_base}/{ts}id_/{original_url}"
         try:
-            resp = get_request_manager().get(dl_url, stream=True, timeout=timeout, allow_redirects=True)
+            remaining = min(timeout, int(deadline - time.time())) if deadline else timeout
+            if remaining <= 0:
+                last_reason = "time_budget_exceeded"
+                break
+            resp = get_request_manager().get(dl_url, stream=True, timeout=remaining, allow_redirects=True)
 
             if resp.status_code in (301, 302):
-                # Follow redirects manually for some archives
                 redirect_url = resp.headers.get("Location", "")
                 if redirect_url:
                     try:
-                        resp = get_request_manager().get(redirect_url, stream=True, timeout=timeout, allow_redirects=True)
+                        resp = get_request_manager().get(redirect_url, stream=True, timeout=remaining, allow_redirects=True)
                         if resp.status_code != 200:
                             last_reason = f"redirect_{resp.status_code}"
                             continue
                     except Exception:
-                        last_reason = f"redirect_failed"
+                        last_reason = "redirect_failed"
                         continue
                 else:
                     last_reason = f"http_{resp.status_code}"
@@ -890,10 +991,7 @@ def _try_download_from_archive(wb_base, timestamp, original_url, dest_path, time
                 continue
             elif resp.status_code == 429:
                 last_reason = "rate_limited"
-                # Proper exponential backoff for rate limiting
-                wait = random.uniform(5, 15)
-                time.sleep(wait)
-                continue
+                break  # Don't retry same archive on rate limit — move to next source
             elif resp.status_code != 200:
                 last_reason = f"http_{resp.status_code}"
                 continue
@@ -1037,6 +1135,13 @@ def _validate_content_magic(filepath, expected_ext):
 def _cdx_best_timestamps(original_url, limit=10):
     """Query CDX for the best available timestamps for a specific file URL.
     Returns list of (timestamp, length) tuples sorted by file size descending."""
+    # Check GhostIndex first
+    gi = get_ghost_index()
+    if gi:
+        cached = gi.best_timestamps(original_url, limit=limit)
+        if cached:
+            return cached
+
     timestamps = []
     try:
         params = {
@@ -1088,62 +1193,81 @@ def _head_check(url, timeout=8):
     return False, 0, ""
 
 
-def download_from_wayback(timestamp, original_url, dest_path):
+def download_from_wayback(timestamp, original_url, dest_path, budget=60):
     """
-    Download a file with aggressive multi-source fallback strategy.
+    Download a file with multi-source fallback strategy and a total time budget.
 
     Tries in order:
       1. Direct download from original URL (live web)
       2. CDX lookup → best available timestamps from Wayback
       3. Wayback Machine with CDX-discovered timestamps
-      4. Arquivo.pt and other CDX_FALLBACKS
-      5. Extra archives (UK Web Archive, Stanford, LoC, etc.)
-      6. Wayback with hardcoded fallback timestamps as last resort
+      4. Wayback Machine with provided timestamp + sparse fallbacks
+      5. CDX fallback archives (Arquivo.pt etc.)
+      6. Extra archives (UK Web Archive, Stanford, LoC, etc.)
+      7. archive.today / redirect-style archives
 
+    Total time budget per file: `budget` seconds (default 60).
     Returns (success, size, reason).
     """
+    deadline = time.time() + budget
+
     dest_dir = os.path.dirname(dest_path)
     if dest_dir:
         os.makedirs(dest_dir, exist_ok=True)
 
     ext = original_url.rsplit(".", 1)[-1].lower().split("?")[0] if "." in original_url else ""
 
-    # Strategy 1: Direct download from original URL
-    ok, size, reason = _try_direct_download(original_url, dest_path, timeout=15)
+    def _expired():
+        return time.time() > deadline
+
+    # Strategy 1: Direct download from original URL (fast, ~15s max)
+    ok, size, reason = _try_direct_download(original_url, dest_path, timeout=10)
     if ok:
         return True, size, reason
+    if _expired():
+        return False, 0, "time_budget_exceeded"
 
-    # Strategy 2: CDX lookup for best timestamps (the secret sauce)
-    cdx_timestamps = _cdx_best_timestamps(original_url, limit=8)
+    # Strategy 2: CDX lookup for best timestamps
+    cdx_timestamps = _cdx_best_timestamps(original_url, limit=5)
     cdx_ts_list = [ts for ts, _ in cdx_timestamps]
+    if _expired():
+        return False, 0, "time_budget_exceeded"
 
-    # Strategy 3: Try Wayback with CDX-discovered timestamps first
+    # Strategy 3: Try Wayback with CDX-discovered timestamps (best chance of success)
     if cdx_ts_list and _check_wayback_alive():
         ok, size, reason = _try_download_from_archive(
-            WB, None, original_url, dest_path, timeout=60,
-            override_timestamps=cdx_ts_list
+            WB, None, original_url, dest_path, timeout=30,
+            override_timestamps=cdx_ts_list[:5], deadline=deadline
         )
         if ok and _validate_content_magic(dest_path, ext):
             return True, size, "ok (via wayback/cdx)"
         elif ok:
-            # Downloaded but failed magic check — remove and try next
             try: os.remove(dest_path)
             except OSError: pass
+    if _expired():
+        return False, 0, "time_budget_exceeded"
 
-    # Strategy 4: Try Wayback with provided timestamp + fallbacks
+    # Strategy 4: Try Wayback with provided timestamp + sparse fallbacks
     if _check_wayback_alive():
-        ok, size, reason = _try_download_from_archive(WB, timestamp, original_url, dest_path, timeout=60)
+        ok, size, reason = _try_download_from_archive(
+            WB, timestamp, original_url, dest_path, timeout=30, deadline=deadline
+        )
         if ok and _validate_content_magic(dest_path, ext):
             return True, size, "ok (via wayback)"
         elif ok:
             try: os.remove(dest_path)
             except OSError: pass
+    if _expired():
+        return False, 0, "time_budget_exceeded"
 
-    # Strategy 5: CDX fallbacks (Arquivo.pt etc.)
+    # Strategy 5: CDX fallback archives
     for fb in CDX_FALLBACKS:
+        if _expired():
+            break
         ok, size, reason = _try_download_from_archive(
-            fb["wb"], timestamp, original_url, dest_path, timeout=60,
-            override_timestamps=cdx_ts_list[:3] if cdx_ts_list else None
+            fb["wb"], timestamp, original_url, dest_path, timeout=20,
+            override_timestamps=cdx_ts_list[:2] if cdx_ts_list else None,
+            deadline=deadline
         )
         if ok and _validate_content_magic(dest_path, ext):
             return True, size, f"ok (via {fb['name']})"
@@ -1153,12 +1277,15 @@ def download_from_wayback(timestamp, original_url, dest_path):
 
     # Strategy 6: Extra archives (wayback-style)
     for arch in EXTRA_ARCHIVES:
+        if _expired():
+            break
         if arch.get("style") != "wayback":
             continue
         try:
             ok, size, reason = _try_download_from_archive(
-                arch["wb"], timestamp, original_url, dest_path, timeout=45,
-                override_timestamps=cdx_ts_list[:2] if cdx_ts_list else None
+                arch["wb"], timestamp, original_url, dest_path, timeout=20,
+                override_timestamps=cdx_ts_list[:2] if cdx_ts_list else None,
+                deadline=deadline
             )
             if ok and _validate_content_magic(dest_path, ext):
                 return True, size, f"ok (via {arch['name']})"
@@ -1168,14 +1295,17 @@ def download_from_wayback(timestamp, original_url, dest_path):
         except Exception:
             continue
 
-    # Strategy 7: archive.today redirect-style (different URL pattern)
+    # Strategy 7: archive.today redirect-style
     for arch in EXTRA_ARCHIVES:
+        if _expired():
+            break
         if arch.get("style") != "redirect":
             continue
         try:
             redirect_url = f"{arch['wb']}/{original_url}"
             rm = get_request_manager()
-            resp = rm.get(redirect_url, stream=True, timeout=30, allow_redirects=True)
+            remaining = max(5, int(deadline - time.time()))
+            resp = rm.get(redirect_url, stream=True, timeout=remaining, allow_redirects=True)
             if resp.status_code == 200:
                 ct = resp.headers.get("content-type", "").lower()
                 if "text/html" not in ct or ext in ("html", "htm"):
@@ -1191,16 +1321,24 @@ def download_from_wayback(timestamp, original_url, dest_path):
         except Exception:
             continue
 
-    # Strategy 8: Wayback as absolute last resort (even if health check failed)
-    if not _check_wayback_alive():
-        ok, size, reason = _try_download_from_archive(WB, timestamp, original_url, dest_path, timeout=90)
-        if ok and _validate_content_magic(dest_path, ext):
-            return True, size, "ok (via wayback-lastresort)"
-        elif ok:
-            try: os.remove(dest_path)
-            except OSError: pass
-
     return False, 0, "all sources failed"
+
+
+def _record_download(original_url, timestamp, size, mime=""):
+    """Record a successful download in GhostIndex."""
+    gi = get_ghost_index()
+    if gi and original_url and timestamp:
+        try:
+            gi.ingest_own_crawl(
+                url=original_url,
+                timestamp=timestamp or datetime.now().strftime("%Y%m%d%H%M%S"),
+                status=200,
+                mime=mime,
+                length=size,
+                digest="",
+            )
+        except Exception:
+            pass
 
 
 def sanitize_filename(name):
@@ -1510,12 +1648,45 @@ def mode_browse_targets():
         return domain
 
 
+def base_crawl_main(domain=None, target_types=None, from_year=None, to_year=None,
+                    max_pages=100, dest=None):
+    """Entry point for god_v2 — wraps crawl_dead_site with interactive prompts for missing params."""
+    if not domain:
+        domain = inquirer.text(message="Domain to crawl (e.g. deadsite.com):").execute()
+        if not domain or not domain.strip():
+            return
+    domain = domain.strip().replace("http://", "").replace("https://", "").rstrip("/")
+
+    if target_types is None:
+        type_choices = [{"name": f"{cat} ({', '.join(sorted(exts)[:5])}...)", "value": cat}
+                        for cat, exts in INTERESTING_EXTENSIONS.items()]
+        selected_types = inquirer.checkbox(
+            message="File types to hunt for (SPACE to toggle, ENTER to confirm):",
+            choices=type_choices,
+        ).execute()
+        target_types = set()
+        if selected_types:
+            for cat in selected_types:
+                target_types.update(INTERESTING_EXTENSIONS[cat])
+        else:
+            target_types = set(ALL_EXTENSIONS)
+
+    if from_year is None:
+        from_year = int(inquirer.text(message="Start year (default 1996):", default="1996").execute())
+    if to_year is None:
+        to_year = int(inquirer.text(message="End year (default 2026):", default="2026").execute())
+
+    dest_dir = dest or os.path.join(DEFAULT_DEST, sanitize_filename(domain))
+    crawl_dead_site(domain, target_types=target_types, from_year=from_year,
+                    to_year=to_year, max_pages=max_pages, dest_dir=dest_dir)
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="GhostCrawl - Dead Site Crawler")
     proxy_group = parser.add_mutually_exclusive_group()
     proxy_group.add_argument("--proxy", help="SOCKS5 proxy (e.g. socks5://127.0.0.1:9050)")
-    proxy_group.add_argument("--tor", action="store_true", help="Route all traffic through Tor (requires Tor on port 9050)")
+    proxy_group.add_argument("--tor", action="store_true", help="Route all traffic through Tor (auto-detects standalone 9050 or Tor Browser 9150)")
     parser.add_argument("--tor-renew", type=int, default=50, metavar="N", help="Renew Tor circuit every N requests (default: 50)")
     parser.add_argument("--dest", help=f"Download directory (default: {DEFAULT_DEST})")
     args, _ = parser.parse_known_args()
@@ -1528,7 +1699,7 @@ def main():
             console.print(f"[bold green]Tor connected — exit IP: {info}[/bold green]")
         else:
             console.print(f"[bold red]Tor connection failed: {info}[/bold red]")
-            console.print("[dim]Make sure Tor is running on port 9050 (install: apt install tor / brew install tor)[/dim]")
+            console.print("[dim]Make sure Tor is running (standalone on 9050 or Tor Browser on 9150)[/dim]")
             sys.exit(1)
 
     get_request_manager(proxy=args.proxy, tor_manager=tor_mgr)

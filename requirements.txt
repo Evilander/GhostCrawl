@@ -13,3 +13,18 @@ beautifulsoup4>=4.12.0
 
 # Optional: Cloudflare bypass (ghostphase.py)
 # cloudscraper>=1.2.71
+
+# GhostIndex (ghostindex.py) — no extra deps, uses stdlib sqlite3
+
+# GHOST Format (ghostformat.py)
+# blake3>=0.3.0           # Faster content hashing (falls back to SHA-256)
+# zstandard>=0.20.0       # Better compression (falls back to gzip)
+# warcio>=1.7.0           # WARC import/export support
+
+# Epstein Archive v2 (epstein_archive/)
+# chromadb>=0.4.0         # Vector search
+# sentence-transformers>=2.2.0  # Embedding generation
+# datasets>=2.14.0        # HuggingFace dataset loading
+# networkx>=3.0           # Knowledge graph
+# pyvis>=0.3.0            # Network visualization
+# python-louvain>=0.16    # Community detection (import community)

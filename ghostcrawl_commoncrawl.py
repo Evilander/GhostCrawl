@@ -1089,11 +1089,27 @@ class CommonCrawlMiner:
 # CLI
 # ═══════════════════════════════════════════════════════════════════
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="GhostCrawl Common Crawl Deep Miner - bypass robots.txt exclusions",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+def main(target_override=None, mode=None, dest=None):
+    if target_override:
+        # Called from god_v2 — bypass argparse
+        class Args:
+            pass
+        args = Args()
+        args.domain = target_override if mode in (None, 'mine') else None
+        args.keyword = None
+        args.extract_media = True
+        args.download = True
+        args.dest = dest or DEFAULT_DEST
+        args.years = None
+        args.max_indexes = None
+        args.triangulate = target_override if mode == 'triangulate' else None
+        args.cdn = target_override if mode == 'cdn' else None
+        args.resurrect = None  # resurrect needs a file, not a domain
+    else:
+        parser = argparse.ArgumentParser(
+            description="GhostCrawl Common Crawl Deep Miner - bypass robots.txt exclusions",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
 Examples:
   # Search for a domain across all CC indexes
   python ghostcrawl_commoncrawl.py oldsite.com/files/*
@@ -1115,21 +1131,21 @@ Examples:
 
   # Limit to specific years
   python ghostcrawl_commoncrawl.py example.com --years 2010 2015
-        """,
-    )
+            """,
+        )
 
-    parser.add_argument('domain', nargs='?', help='Domain/URL pattern to mine')
-    parser.add_argument('--keyword', '-k', nargs='+', help='Keywords to search within page content')
-    parser.add_argument('--extract-media', '-m', action='store_true', help='Extract media URLs from HTML')
-    parser.add_argument('--download', '-d', action='store_true', help='Download extracted media')
-    parser.add_argument('--dest', default=DEFAULT_DEST, help='Download destination')
-    parser.add_argument('--years', nargs=2, type=int, metavar=('START', 'END'), help='Year range filter')
-    parser.add_argument('--max-indexes', type=int, default=None, help='Max CC indexes to search')
-    parser.add_argument('--triangulate', '-t', metavar='USERNAME', help='Triangulate a username across platforms')
-    parser.add_argument('--cdn', metavar='DOMAIN', help='CDN archaeology for a domain')
-    parser.add_argument('--resurrect', '-r', metavar='FILE', help='Resurrect dead URLs from a file')
+        parser.add_argument('domain', nargs='?', help='Domain/URL pattern to mine')
+        parser.add_argument('--keyword', '-k', nargs='+', help='Keywords to search within page content')
+        parser.add_argument('--extract-media', '-m', action='store_true', help='Extract media URLs from HTML')
+        parser.add_argument('--download', '-d', action='store_true', help='Download extracted media')
+        parser.add_argument('--dest', default=DEFAULT_DEST, help='Download destination')
+        parser.add_argument('--years', nargs=2, type=int, metavar=('START', 'END'), help='Year range filter')
+        parser.add_argument('--max-indexes', type=int, default=None, help='Max CC indexes to search')
+        parser.add_argument('--triangulate', '-t', metavar='USERNAME', help='Triangulate a username across platforms')
+        parser.add_argument('--cdn', metavar='DOMAIN', help='CDN archaeology for a domain')
+        parser.add_argument('--resurrect', '-r', metavar='FILE', help='Resurrect dead URLs from a file')
 
-    args = parser.parse_args()
+        args = parser.parse_args()
 
     if args.triangulate:
         print(f"\n{'='*60}")
@@ -1172,7 +1188,7 @@ Examples:
             print("No CDN domains found.")
 
     elif args.resurrect:
-        with open(args.resurrect, 'r') as f:
+        with open(args.resurrect, 'r', encoding='utf-8') as f:
             urls = [line.strip() for line in f if line.strip()]
 
         print(f"\nResurrecting {len(urls)} dead URLs...")

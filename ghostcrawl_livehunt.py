@@ -389,15 +389,26 @@ def display_livehunt_results(hits, title="Live Hunt Results"):
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="GhostCrawl Live Hunt — Real-Time Treasure Discovery")
-    parser.add_argument("--shodan", action="store_true", help="Run Shodan open directory hunt")
-    parser.add_argument("--github", action="store_true", help="Run GitHub leak scanner")
-    parser.add_argument("--opendir", type=str, help="Enumerate a specific open directory URL")
-    parser.add_argument("--domain", type=str, help="Target domain for GitHub/Shodan scoping")
-    parser.add_argument("--all", action="store_true", help="Run all hunts")
-    args = parser.parse_args()
+def main(target_override=None, mode=None):
+    if target_override:
+        # Called from god_v2 — bypass argparse
+        class Args:
+            pass
+        args = Args()
+        args.shodan = mode in ('shodan', 'all')
+        args.github = mode in ('github', 'all')
+        args.opendir = target_override if mode == 'opendir' else None
+        args.domain = target_override if mode != 'opendir' else None
+        args.all = mode == 'all'
+    else:
+        import argparse
+        parser = argparse.ArgumentParser(description="GhostCrawl Live Hunt — Real-Time Treasure Discovery")
+        parser.add_argument("--shodan", action="store_true", help="Run Shodan open directory hunt")
+        parser.add_argument("--github", action="store_true", help="Run GitHub leak scanner")
+        parser.add_argument("--opendir", type=str, help="Enumerate a specific open directory URL")
+        parser.add_argument("--domain", type=str, help="Target domain for GitHub/Shodan scoping")
+        parser.add_argument("--all", action="store_true", help="Run all hunts")
+        args = parser.parse_args()
 
     console.print(f"\n[bold red]GHOSTCRAWL LIVE HUNT[/bold red] [dim]— Real-Time Treasure Discovery[/dim]\n")
 
